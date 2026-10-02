@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>柏青哥技术演示 Demo（虚拟弹珠 / 虚拟积分 / 纯学习用）</title>
+<style>
+  /* 页面只做居中与保护层，视觉全部交给 Canvas */
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #0b0e14; overflow: hidden;
+    overscroll-behavior: none;                 /* 禁止移动端下拉刷新 / 橡皮筋 */
+    -webkit-tap-highlight-color: transparent;  /* 去掉手机点击灰块 */
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;                        /* 禁止双指缩放与滑动 */
+  }
+  body {
+    position: fixed; inset: 0;                 /* iOS 地址栏伸缩时也不溢出 */
+    display: flex; align-items: center; justify-content: center;
+    height: 100dvh;                            /* 支持动态视口高度的浏览器优先 */
+  }
+  #stage { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<script>
+"use strict";
+/* =========================================================
+ * 柏青哥 Demo —— 阶段 1：骨架与主循环
+ * 说明：本项目仅为编程学习演示，只使用虚拟弹珠与虚拟积分，
+ *      不含任何赌博、充值、现金兑换功能。
+ * ========================================================= */
+
+/* ---------- 0. 视觉/音频升级总开关（一键回退原始简易版） ----------
+ * true  = 启用升级皮肤、动态背景、机台显示屏、音效
+ * false = 加载阶段直接跳过，等同原始版本
+ * 运行中按 V 键可热切换：优先复用已烘焙的贴图，切换即时生效
+ */
+const UPGRADE = { bg: true, board: true, hud: true, audio: true, on: true };
+
+/* ---------- 1. 全局常量（参数集中管理，禁止散落魔法数字） ---------- */
+const CFG = {
+  W: 480,               // 逻辑画布宽（CSS 像素）
+  H: 720,               // 逻辑画布高（CSS 像素）
+  STEP: 1 / 60,         // 固定逻辑步长（秒）—— 物理确定性依赖此值
+  MAX_STEPS: 5,         // 单帧最多追帧次数，防止切后台后爆炸
+  BG: "#0d1220",        // 底色
+  GRID: "rgba(90,140,220,0.10)", // 调试网格
+  FG: "#8fb6ff"         // 调试文字
+};
+
+/* ---------- 2. 全局游戏状态（后续阶段往这里挂数据） ---------- */
+const GAME = {
+  time: 0,        // 累计逻辑时间（秒）
+  frame: 0,       // 逻辑帧计数
+  fps: 0,         // 实时帧率（仅调试显示）
+  paused: false,  // 暂停开关（失焦自动暂停）
+  // 以下为后续阶段预留挂载点，本阶段保持为空
+  drawers: [],    // 渲染层注册表：各模块自注册，按注册顺序绘制
+  updaters: [],   // 逻辑层注册表：每逻辑帧按注册顺序调用 fn(dt)
+  pegs: [],       // 阶段 2：钉阵
+  balls: [],      // 阶段 3：弹珠
+  score: 0,       // 阶段 4：虚拟积分
+  ballsLeft: 0    // 阶段 3：剩余虚拟弹珠
+};
+
+/* ---------- 3. 画布初始化与自适应缩放 ---------- */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // 等比缩放到可视区域，留 8px 安全边距；移动端用 visualViewport 取真实可视尺寸
+  const vv = window.visualViewport;
+  const vw = (vv && vv.width) || window.innerWidth;
+  const vh = (vv && vv.height) || window.innerHeight;
+  const scale = Math.min(
+    (vw - 16) / CFG.W,
+    (vh - 16) / CFG.H
+  );
+  canvas.width  = Math.round(CFG.W * dpr);
+  canvas.height = Math.round(CFG.H * dpr);
+  canvas.style.width  = Math.round(CFG.W * scale) + "px";
+  canvas.style.height = Math.round(CFG.H * scale) + "px";
+  // 之后所有绘制都按逻辑坐标书写，由这里统一缩放
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+}
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", () => setTimeout(resize, 120));
+if (window.visualViewport) window.visualViewport.addEventListener("resize", resize);
+resize();
+
+/* ---------- 4. 逻辑更新：固定步长，所有物理/计分写在这里 ---------- */
+function update(dt) {
+  GAME.time += dt;
+  GAME.frame++;
+  for (const fn of GAME.updaters) fn(dt); // 模块逻辑层（固定 dt，结果可复现）
+}
+
+/* ---------- 5. 渲染：只读状态，不做逻辑计算 ---------- */
+function drawGrid() {
+  ctx.strokeStyle = CFG.GRID;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= CFG.W; x += 40) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, CFG.H); }
+  for (let y = 0; y <= CFG.H; y += 40) { ctx.moveTo(0, y + 0.5); ctx.lineTo(CFG.W, y + 0.5); }
+  ctx.stroke();
+}
+
+function drawHUD() {
+  // 放到画布最底部 24px 空档，避免与 PLAY 的顶部状态面板重叠
+  ctx.fillStyle = CFG.FG;
+  ctx.font = "12px monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(
+    "FPS " + GAME.fps.toFixed(0) + "  frame " + GAME.frame +
+    "  phase 6/6  pegs " + GAME.pegs.length, 10, 700);
+}
+
+function render() {
+  ctx.fillStyle = CFG.BG;
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+  drawGrid();   // 调试参考网格，位于所有模块之下
+  for (const fn of GAME.drawers) fn(ctx); // 模块渲染层
+  drawHUD();
+}
+
+/* ---------- 6. 主循环：累加器驱动固定步长 ---------- */
+let last = performance.now();
+let acc = 0;
+let fpsTimer = 0, fpsCount = 0;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  let delta = (now - last) / 1000;
+  last = now;
+  if (delta > 0.25) delta = 0.25;   // 切标签页回来时钳制，避免追帧风暴
+
+  // FPS 统计（每 0.5 秒刷新一次，避免数字抖动）
+  fpsTimer += delta; fpsCount++;
+  if (fpsTimer >= 0.5) { GAME.fps = fpsCount / fpsTimer; fpsTimer = 0; fpsCount = 0; }
+
+  if (!GAME.paused) {
+    acc += delta;
+    let steps = 0;
+    while (acc >= CFG.STEP && steps < CFG.MAX_STEPS) {
+      update(CFG.STEP);   // 恒定 dt，保证物理结果可复现
+      acc -= CFG.STEP;
+      steps++;
+    }
+    if (steps === CFG.MAX_STEPS) acc = 0; // 追不动就丢弃余量，宁可慢不跳变
+  }
+  render();
+}
+
+/* ---------- 7. 失焦暂停，避免后台空转 ---------- */
+document.addEventListener("visibilitychange", () => {
+  GAME.paused = document.hidden;
+  if (!document.hidden) { last = performance.now(); acc = 0; } // 回来时重置计时
+});
+
+// 等所有模块脚本加载完成后再启动主循环，避免首帧拿不到模块数据
+window.addEventListener("load", () => requestAnimationFrame(loop));
+
+/* ---------- 8. 升级模块热切换（V 键） ---------- */
+window.addEventListener("keydown", (e) => {
+  if (e.code !== "KeyV" || e.repeat) return;
+  e.preventDefault();
+  UPGRADE.on = !UPGRADE.on;
+  // 用 typeof 保护：模块未加载时不会抛 ReferenceError
+  if (typeof SKINBG !== "undefined") SKINBG.setEnabled(UPGRADE.on);
+  if (typeof SKIN !== "undefined") SKIN.setEnabled(UPGRADE.on);
+  if (typeof HUD !== "undefined") HUD.setEnabled(UPGRADE.on);
+  if (typeof AUDIO !== "undefined") AUDIO.setEnabled(UPGRADE.on);
+  if (typeof GLASS !== "undefined") GLASS.setEnabled(UPGRADE.on);
+  if (typeof DEPTH !== "undefined") DEPTH.setEnabled(UPGRADE.on);
+  if (typeof SHELL !== "undefined") SHELL.setEnabled(UPGRADE.on);
+  if (typeof POCKETS !== "undefined") {
+    SKIN.pockets = UPGRADE.on ? POCKETS._wrapped : POCKETS._orig;
+  }
+  if (typeof BACKGROUND !== "undefined") BACKGROUND.setEnabled(UPGRADE.on);
+});
+</script>
+<!-- 加载顺序有依赖：board/balls 提供几何与物理 → game 的 PLAY.draw 需在 hud 之前被覆写
+     → fx 在 state 之前（粒子要在结算遮罩之下）→ 升级模块最后加载并覆写绘制方法 -->
+<script src="board.js"></script>
+<script src="balls.js"></script>
+<script src="game.js"></script>
+<script src="fx.js"></script>
+<script src="state.js"></script>
+<script src="debug.js"></script>
+<!-- 升级层：音频 → 背景 → 盘面皮肤 → 机台显示屏（顺序不可调换） -->
+<script src="audio.js"></script>
+<script src="skin-bg.js"></script>
+<script src="skin-board.js"></script>
+<script src="hud.js"></script>
+<script src="skin-glass.js"></script>
+<!-- 增量玩法层：奖励靶（R1）→ 生命系统与最高分（R2） -->
+<script src="reward.js"></script>
+<script src="risk.js"></script>
+<script src="life.js"></script>
+<script src="rank.js"></script>
+<!-- 伪3D 光影层：需在 skin-board 之后（要重烘焙其贴图并覆写 BOARD.draw） -->
+<script src="depth.js"></script>
+<!-- 壳体/氛围/UI 层：需在 skin-bg 与 hud 之后（要重烘焙其底图） -->
+<script src="depth-shell.js"></script>
+<!-- 特效增强层：需在 reward/risk 之后（要包装 REWARD.hit 与入袋回调） -->
+<script src="fx2.js"></script>
+<!-- 连击提示层：需在 game/fx2 之后（要包装入袋回调与 PLAY.reset） -->
+<script src="combo.js"></script>
+<!-- 布局重构层：需在 reward/risk 之后（要替换其公开数据与绘制方法） -->
+<script src="layout.js"></script>
+<!-- 得分槽金属化层：需在 skin-board 之后（要覆写 SKIN.pockets） -->
+<script src="pockets.js"></script>
+<!-- 背板替换层：需在 skin-board 之后（要重烘焙 SKIN.print） -->
+<script src="background.js"></script>
+<!-- 音效层：需在 audio/game 之后（要包装 PLAY.fire 与 AUDIO.setEnabled） -->
+<script src="sfx.js"></script>
+<!-- 被动机关层：需在 balls/reward 之后（要追加 substep 碰撞几何） -->
+<script src="triggers.js"></script>
+<!-- 触屏交互层：点击蓄力/松手发射 + 开始页与结算页点击；键盘逻辑不受影响 -->
+<script src="touch.js"></script>
+<!-- 欢迎界面：必须最后加载，保证它的绘制层在最顶层 -->
+<script src="welcome.js"></script>
+</body>
+</html>
